@@ -4,94 +4,158 @@ import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-# Initialize clients
+# Initialize AWS clients
 ec2 = boto3.client('ec2')
 cloudwatch = boto3.client('logs')
 sns = boto3.client('sns')
 
-# Configuration (set these as environment variables)
-NACL_ID ='acl-078def87f86593bfa' #edit according to your NACLID
-TOPIC_ARN ='arn:aws:sns:eu-west-2:027165077285:BruteForceAlerts' #edit according to your TOPIC_ARN
-LOG_GROUP ='CIS-Linux-Server-Authlogs'  # e.g., '/var/log/auth.log'
-FAILURE_THRESHOLD = 5  # Block after 5 failures
-TIME_WINDOW_MINUTES = 5  # Analyze last 5 minutes of logs
+# Configuration - set these as environment variables in Lambda
+NACL_ID = os.getenv('NACL_ID', 'acl-078def87f86593bfa')
+TOPIC_ARN = os.getenv('TOPIC_ARN', 'arn:aws:sns:eu-west-2:027165077285:BruteForceAlerts')
+LOG_GROUP = os.getenv('LOG_GROUP', 'CIS-Linux-Server-Authlogs')
+
+# Protection parameters
+FAILURE_THRESHOLD = 3  # Block after 3 failures (reduced from 5)
+TIME_WINDOW_MINUTES = 10  # Analyze last 10 minutes of logs (increased from 5)
+EPHEMERAL_PORTS = (32768, 60999)  # Required for TCP responses
 
 def extract_failed_attempts():
-    """Extract IPs with multiple failed login attempts from CloudWatch Logs"""
-    # Get log events from the last X minutes
-    end_time = int(datetime.now().timestamp()) * 1000
-    start_time = int((datetime.now() - timedelta(minutes=TIME_WINDOW_MINUTES)).timestamp()) * 1000
-
-    # Filter pattern for SSH failures (adjust for your OS)
-    filter_pattern = '?"Failed password for" ?"invalid user" ?"port" ?"ssh2" ?"Failed:"'
-
-    response = cloudwatch.filter_log_events(
-        logGroupName=LOG_GROUP,
-        startTime=start_time,
-        endTime=end_time,
-        filterPattern=filter_pattern,
-        limit=10000
-    )
-
-    # Count failures per IP
-    ip_counts = defaultdict(int)
-    ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
-
-    for event in response['events']:
-        ip_match = ip_pattern.search(event['message'])
-        if ip_match:
-            ip = ip_match.group()
-            ip_counts[ip] += 1
-
-    # Return IPs exceeding threshold
-    return [ip for ip, count in ip_counts.items() if count >= FAILURE_THRESHOLD]
+    """
+    Extracts IPs with multiple failed login attempts from CloudWatch Logs
+    Returns: List of IPs that exceeded failure threshold
+    """
+    print("[DEBUG] Starting log extraction")
+    
+    # Calculate time range
+    now = datetime.now()
+    start_time = int((now - timedelta(minutes=TIME_WINDOW_MINUTES)).timestamp()) * 1000
+    end_time = int(now.timestamp()) * 1000
+    
+    # Enhanced filter pattern for SSH failures
+    filter_pattern = r'?(Failed password|invalid user|authentication failure|Connection closed)'
+    
+    try:
+        # Get log events with pagination handling
+        all_events = []
+        next_token = None
+        
+        while True:
+            params = {
+                'logGroupName': LOG_GROUP,
+                'startTime': start_time,
+                'endTime': end_time,
+                'filterPattern': filter_pattern,
+                'limit': 10000
+            }
+            if next_token:
+                params['nextToken'] = next_token
+                
+            response = cloudwatch.filter_log_events(**params)
+            all_events.extend(response['events'])
+            
+            if 'nextToken' not in response:
+                break
+            next_token = response['nextToken']
+        
+        # Count failures per IP with enhanced IP matching
+        ip_counts = defaultdict(int)
+        ip_pattern = re.compile(r'(?P<ip>\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)')
+        
+        for event in all_events:
+            match = ip_pattern.search(event['message'])
+            if match:
+                ip = match.group('ip')
+                ip_counts[ip] += 1
+        
+        print(f"[DEBUG] IP counts: {dict(ip_counts)}")
+        return [ip for ip, count in ip_counts.items() if count >= FAILURE_THRESHOLD]
+        
+    except Exception as e:
+        print(f"[ERROR] Log extraction failed: {str(e)}")
+        return []
 
 def block_ip_in_nacl(ip):
-    """Block IP in NACL for SSH/RDP"""
+    """
+    Blocks an IP in Network ACL for SSH/RDP
+    Returns: True if successful, False otherwise
+    """
+    print(f"[DEBUG] Attempting to block IP: {ip}")
+    
     try:
-        for port in [22, 3389]:
+        # First ensure ephemeral ports are allowed (required for TCP)
+        ec2.create_network_acl_entry(
+            NetworkAclId=NACL_ID,
+            RuleNumber=90,  # High priority allow rule
+            Protocol='6',  # TCP
+            RuleAction='ALLOW',
+            CidrBlock='0.0.0.0/0',
+            Egress=True,
+            PortRange={'From': EPHEMERAL_PORTS[0], 'To': EPHEMERAL_PORTS[1]}
+        )
+        
+        # Block SSH (22) and RDP (3389)
+        for port, rule_num in [(22, 122), (3389, 138)]:
             ec2.create_network_acl_entry(
                 NetworkAclId=NACL_ID,
-                RuleNumber=100 + port,  # 122 for SSH, 138 for RDP
+                RuleNumber=rule_num,
                 Protocol='6',  # TCP
                 RuleAction='DENY',
                 CidrBlock=f"{ip}/32",
                 Egress=False,
                 PortRange={'From': port, 'To': port}
             )
+        
+        print(f"[SUCCESS] Blocked {ip} in NACL")
         return True
+        
     except Exception as e:
-        print(f"Error blocking {ip}: {str(e)}")
+        print(f"[ERROR] Blocking failed for {ip}: {str(e)}")
         return False
 
 def lambda_handler(event, context):
+    """
+    Main Lambda handler function
+    """
+    print(f"[INFO] Execution started at {datetime.now().isoformat()}")
+    
     # Step 1: Detect brute-force IPs
     malicious_ips = extract_failed_attempts()
+    print(f"[INFO] Detected malicious IPs: {malicious_ips}")
     
     if not malicious_ips:
+        print("[INFO] No brute-force attempts detected")
         return {"status": "No brute-force attempts detected"}
-
+    
     # Step 2: Block IPs
     blocked_ips = []
     for ip in malicious_ips:
         if block_ip_in_nacl(ip):
             blocked_ips.append(ip)
-
-    # Step 3: Send alert
+    
+    # Step 3: Send alert if any IPs were blocked
     if blocked_ips:
+        print(f"[INFO] Successfully blocked IPs: {blocked_ips}")
         sns.publish(
             TopicArn=TOPIC_ARN,
-            Subject='🚨 ALERT: Brute-Force IPs Blocked Automatically',
+            Subject='🚨 ALERT: Brute-Force IPs Blocked',
             Message=f'''
-            Automated Brute-Force Protection:
+            Brute-Force Protection Alert:
+            
             🔥 Blocked IPs: {", ".join(blocked_ips)}
-            🛡️ Ports Protected: SSH (22) + RDP (3389)
-            🔗 NACL: {NACL_ID}
-            ⏰ Time: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+            🛡️ Protected Ports: SSH (22), RDP (3389)
+            📊 Failures Threshold: {FAILURE_THRESHOLD} attempts
+            ⏱️ Time Window: Last {TIME_WINDOW_MINUTES} minutes
+            🕒 Block Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            
+            NACL ID: {NACL_ID}
+            Log Group: {LOG_GROUP}
             '''
         )
-
+    
     return {
         'statusCode': 200,
-        'body': f"Blocked {len(blocked_ips)} IPs: {', '.join(blocked_ips)}"
+        'body': {
+            'blocked_ips': blocked_ips,
+            'message': f"Blocked {len(blocked_ips)} IP addresses"
+        }
     }
